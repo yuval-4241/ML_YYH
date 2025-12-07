@@ -1,73 +1,71 @@
 import requests
 import re
+import time
 from pathlib import Path
 
-# --- הגדרות וקבועים ---
-API_KEY = "e9f8ab45-8bc9-438a-ab86-9574083165d7"  # המפתח שלך
+# --- Configuration ---
+
+# Add your list of keys here
+API_KEYS = [
+    "e9f8ab45-8bc9-438a-ab86-9574083165d7",
+    "93d9ebb5-0fab-40d0-b82d-ed72f8d54105",
+    "36e5cde5-ac71-439b-9318-c3bbe66fb81c",
+
+]
+
 BASE_URL = "https://content.guardianapis.com/search"
-PROJECT_DIR = Path(r"C:\Users\yuval\Desktop\לימודים\ML")
+# Make sure this path matches where your current 900 articles are!
+PROJECT_DIR = Path(r"C:\Users\yuval\Desktop\לימודים\ML\data")
 
 CATEGORIES = ['news', 'sport', 'Opinion', 'culture']
-# העליתי קצת את הכמות כדי לפצות על כתבות שיימחקו בסינון (כמו התיקונים)
-ARTICLES_PER_CATEGORY = 200
+
+# We want 1000 NEW articles per key (Total 4000)
+# Split across 4 categories = 250 new articles per category, per key.
+TARGET_NEW_ARTICLES_PER_KEY = 1000
+TARGET_PER_CATEGORY = int(TARGET_NEW_ARTICLES_PER_KEY / len(CATEGORIES))
+
+PAGE_SIZE = 50
 
 
 def clean_html(raw_html):
-    """פונקציה לניקוי תגיות HTML משדה ה-TrailText"""
     if not raw_html:
         return ""
     cleanr = re.compile('<.*?>')
-    cleantext = re.sub(cleanr, '', raw_html)
-    return cleantext.strip()
+    return re.sub(cleanr, '', raw_html).strip()
 
 
 def create_article_content(article):
     fields = article.get("fields", {})
     body = (fields.get("bodyText") or "").strip()
 
-    # בדיקה בסיסית שיש תוכן
     if not body:
         return None
 
-    # חילוץ שדות בסיסיים
     section = article.get("sectionName", "General")
     date = (article.get("webPublicationDate") or "")[:10]
     byline = fields.get("byline", "Unknown Author")
     url = article.get("webUrl", "")
     title = fields.get("headline", article.get("webTitle", "Untitled"))
 
-    # --- חלק 1: התיקון לבעיית ה-News ---
-    # סינון אגרסיבי של כתבות "תיקונים והבהרות"
-    # אם המילים Correction/Clarification מופיעות בכותרת או בכותב - מדלגים
-    low_title = title.lower()
-    low_byline = byline.lower()
-
-    if "correction" in low_title or "clarification" in low_title:
+    # Filter Corrections
+    if "correction" in title.lower() or "clarification" in title.lower():
         return None
-    if "corrections" in low_byline:  # תופס את 'Corrections and clarifications editor'
+    if "corrections" in byline.lower():
         return None
 
-    # --- חלק 2: חילוץ התוספות (תגיות ומיני-כותרת) ---
-
-    # חילוץ המיני-כותרת (Trail Text) וניקוי מ-HTML
     trail_text = clean_html(fields.get("trailText", ""))
-
-    # חילוץ התגיות (Tags)
-    tags_data = article.get("tags", [])
-    # יוצרים רשימה של שמות התגיות (למשל: 'World news', 'Politics')
-    tags_names = [t.get('webTitle') for t in tags_data]
+    tags_names = [t.get('webTitle') for t in article.get("tags", [])]
     tags_str = ", ".join(tags_names)
 
-    # --- בניית הטקסט הסופי לשמירה ---
     return (
         f"The Guardian | {section} | {date}\n"
         f"By {byline}\n"
         f"{url}\n"
-        f"Tags: {tags_str}\n"  # הוספת התגיות
+        f"Tags: {tags_str}\n"
         f"\n"
         f"{title}\n"
         f"{'-' * 20}\n"
-        f"{trail_text}\n"  # הוספת המיני-כותרת
+        f"{trail_text}\n"
         f"{'-' * 60}\n"
         f"{body}\n"
     )
@@ -75,57 +73,104 @@ def create_article_content(article):
 
 def main():
     print(f"Fetching data to: {PROJECT_DIR}")
+    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for category in CATEGORIES:
-        clean_category = category.lower()
-        if clean_category == 'opinion':
-            api_section = 'commentisfree'
-        else:
-            api_section = clean_category
+    # This cursor tracks the page number for each category globally.
+    # It ensures Key #2 starts searching where Key #1 ended.
+    category_page_cursor = {category: 1 for category in CATEGORIES}
 
-        print(f"--- Processing: {category} (Asking API for: {api_section}) ---")
+    for key_index, current_api_key in enumerate(API_KEYS):
+        print(f"\n{'=' * 20} SWITCHING TO API KEY #{key_index + 1} {'=' * 20}")
 
-        params = {
-            "api-key": API_KEY,
-            "page-size": ARTICLES_PER_CATEGORY,
-            "section": api_section,
-            "order-by": "newest",
-            # הוספנו את trailText ואת trailText לרשימת השדות
-            "show-fields": "headline,byline,bodyText,trailText",
-            # הוספנו בקשה לקבלת כל התגיות
-            "show-tags": "all"
-        }
+        # Track how many NEW articles this specific key has collected
+        key_total_collected = 0
 
-        try:
-            resp = requests.get(BASE_URL, params=params)
-            resp.raise_for_status()
-            results = resp.json()["response"].get("results", [])
+        for category in CATEGORIES:
+            print(f"\n--- Category: {category} (Looking for {TARGET_PER_CATEGORY} new articles) ---")
 
-            if not results:
-                print(f"NO RESULTS for {category}")
-                continue
+            clean_category = category.lower()
+            api_section = 'commentisfree' if clean_category == 'opinion' else clean_category
 
-            output_dir = PROJECT_DIR / "data" / category
-            output_dir.mkdir(parents=True, exist_ok=True)
+            category_new_collected = 0
 
-            count = 0
-            for article in results:
-                article_id = article["id"].replace("/", "_")
-                file_path = output_dir / f"{article_id}.txt"
+            # loop until we find enough NEW articles for this category
+            while category_new_collected < TARGET_PER_CATEGORY:
+                current_page = category_page_cursor[category]
 
-                # אנחנו לא בודקים if exists כי אנחנו רוצים לדרוס קבצים ישנים
-                # כדי שיתעדכנו עם התגיות והמיני-כותרת החדשות
-                content = create_article_content(article)
+                params = {
+                    "api-key": current_api_key,
+                    "page-size": PAGE_SIZE,
+                    "page": current_page,
+                    "section": api_section,
+                    "order-by": "newest",
+                    "show-fields": "headline,byline,bodyText,trailText",
+                    "show-tags": "all"
+                }
 
-                # אם התוכן חזר ריק (בגלל הסינון שלנו) - לא שומרים
-                if content:
-                    file_path.write_text(content, encoding="utf-8")
-                    count += 1
+                try:
+                    # Request data
+                    resp = requests.get(BASE_URL, params=params)
 
-            print(f"Successfully saved {count} articles in {category}")
+                    # Handle Quota Limit (429)
+                    if resp.status_code == 429:
+                        print(f"!! Quota exceeded for Key #{key_index + 1}. Moving to next key...")
+                        # Break the 'while' loop to skip to the next category/key
+                        # But actually we want to break the CATEGORY loop too.
+                        # For simplicity, we force the counters to max to exit this key.
+                        category_new_collected = TARGET_PER_CATEGORY
+                        key_total_collected = TARGET_NEW_ARTICLES_PER_KEY
+                        break
 
-        except Exception as e:
-            print(f"Error fetching {category}: {e}")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    results = data["response"].get("results", [])
+
+                    if not results:
+                        print(f"No more historical data available for {category}.")
+                        break
+
+                    output_dir = PROJECT_DIR / "data" / category
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    page_saved_count = 0
+                    skipped_count = 0
+
+                    for article in results:
+                        article_id = article["id"].replace("/", "_")
+                        file_path = output_dir / f"{article_id}.txt"
+
+                        # --- CRITICAL CHANGE: SKIP IF EXISTS ---
+                        if file_path.exists():
+                            skipped_count += 1
+                            continue  # Skip to next article, don't save, don't count
+
+                        # Process Content
+                        content = create_article_content(article)
+                        if content:
+                            file_path.write_text(content, encoding="utf-8")
+                            page_saved_count += 1
+                            category_new_collected += 1
+
+                    # Update User
+                    print(f"   Page {current_page}: Saved {page_saved_count} new | Skipped {skipped_count} existing.")
+
+                    # Move to next page for next time
+                    category_page_cursor[category] += 1
+
+                    # Small sleep to be polite
+                    time.sleep(0.3)
+
+                except Exception as e:
+                    print(f"Error on {category} page {current_page}: {e}")
+                    time.sleep(2)  # Wait a bit if error occurs
+                    break
+
+            key_total_collected += category_new_collected
+            print(f"Finished {category} for this key. Total new: {category_new_collected}")
+
+        print(f"Key #{key_index + 1} finished. Total new articles collected: {key_total_collected}")
+
+    print("\nScript finished. You should now have your target dataset!")
 
 
 if __name__ == "__main__":
